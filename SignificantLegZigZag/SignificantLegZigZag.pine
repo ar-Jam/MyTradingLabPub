@@ -1,0 +1,227 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+//@version=6
+indicator("Significant Leg ZigZag", "SigLeg ZZ", overlay = true, max_lines_count = 500)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Inputs
+// ─────────────────────────────────────────────────────────────────────────────
+const string GRP_FAST = "Fast ZigZag (displayed)"
+const string GRP_SLOW = "Slow ZigZag (hidden)"
+const string GRP_DISP = "Display"
+const string GRP_DBG  = "Debug"
+
+int fastLeft  = input.int(2,  "Left length",  minval = 1, group = GRP_FAST)
+int fastRight = input.int(2,  "Right length", minval = 1, group = GRP_FAST)
+int slowLeft  = input.int(25, "Left length",  minval = 1, group = GRP_SLOW, tooltip = "Controls how important a slow pivot is.")
+int slowRight = input.int(5,  "Right length", minval = 1, group = GRP_SLOW, tooltip = "Controls how fast a slow pivot is confirmed.")
+
+color normColor   = input.color(color.gray, "Normal leg",      inline = "norm", group = GRP_DISP)
+int   normWidth   = input.int(1, "", minval = 1, maxval = 10,  inline = "norm", group = GRP_DISP)
+color sigColor    = input.color(#00E5FF,    "Significant leg", inline = "sig",  group = GRP_DISP)
+int   sigWidth    = input.int(3, "", minval = 1, maxval = 10,  inline = "sig",  group = GRP_DISP)
+bool  showPending = input.bool(true, "Show pending legs (dashed)", group = GRP_DISP)
+
+bool  showSlow  = input.bool(false, "Show slow ZigZag", inline = "slow", group = GRP_DBG)
+color slowColor = input.color(color.orange, "",        inline = "slow", group = GRP_DBG)
+bool  showStats = input.bool(true, "Show stats table", group = GRP_DBG)
+
+// Every slow pivot must also be a fast pivot (see f_pivotHigh / f_pivotLow).
+if slowLeft < fastLeft or slowRight < fastRight
+    runtime.error("Slow ZigZag lengths must be >= fast lengths (slow left >= fast left and slow right >= fast right).")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────────────────────────────────────
+const int EV_NONE    = 0   // pivot ignored
+const int EV_APPEND  = 1   // new pivot appended (a new leg was created)
+const int EV_REPLACE = 2   // last pivot replaced by a more extreme one
+
+const int ST_NORMAL      = 0
+const int ST_PENDING     = 1
+const int ST_SIGNIFICANT = 2
+
+const int FAST_MAX_PIVOTS = 420   // one line per pivot; keeps us under max_lines_count
+const int SLOW_MAX_PIVOTS = 60
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Types
+// ─────────────────────────────────────────────────────────────────────────────
+type Pivot
+    int   bar
+    float price
+    bool  isHigh
+    line  leg          // line from the previous pivot to this one (na if not drawn)
+
+type ZigZag
+    array<Pivot> pivots
+    int          maxPivots
+    bool         draw
+    color        col
+    int          width
+    string       style
+
+// Tracks the fast lines whose state can still change.
+type Matcher
+    line confirmed       // fast leg matching the latest slow leg (end pivot may still move)
+    line pending         // fast leg starting at the latest slow pivot
+    int  finalCount = 0  // matched legs that became Final
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pivot detection (shared by both ZigZags)
+// Tie rule: strictly beyond the left window, at least equal to the right window.
+// Among equal extremes, the earliest bar wins. Because the conditions only get
+// stricter as the windows grow, every slow pivot is also a fast pivot.
+// ─────────────────────────────────────────────────────────────────────────────
+f_pivotHigh(int left, int right) =>
+    float c        = high[right]
+    float leftHH   = ta.highest(high, left)
+    float leftMax  = leftHH[right + 1]
+    float rightMax = ta.highest(high, right)
+    not na(c) and not na(leftMax) and not na(rightMax) and c > leftMax and c >= rightMax
+
+f_pivotLow(int left, int right) =>
+    float c        = low[right]
+    float leftLL   = ta.lowest(low, left)
+    float leftMin  = leftLL[right + 1]
+    float rightMin = ta.lowest(low, right)
+    not na(c) and not na(leftMin) and not na(rightMin) and c < leftMin and c <= rightMin
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ZigZag construction (shared by both ZigZags)
+// ─────────────────────────────────────────────────────────────────────────────
+// Feeds one pivot into the ZigZag. Returns EV_NONE, EV_APPEND or EV_REPLACE.
+method add(ZigZag this, int b, float price, bool isHigh) =>
+    int ev = EV_NONE
+    if this.pivots.size() == 0
+        this.pivots.push(Pivot.new(b, price, isHigh))
+        ev := EV_APPEND
+    else
+        Pivot last = this.pivots.last()
+        if last.isHigh != isHigh
+            Pivot p = Pivot.new(b, price, isHigh)
+            if this.draw
+                p.leg := line.new(last.bar, last.price, b, price, color = this.col, width = this.width, style = this.style)
+            this.pivots.push(p)
+            if this.pivots.size() > this.maxPivots
+                Pivot old = this.pivots.shift()
+                if not na(old.leg)
+                    line.delete(old.leg)
+            ev := EV_APPEND
+        // Strictly more extreme only: on equal prices the earlier pivot is kept.
+        else if isHigh ? price > last.price : price < last.price
+            last.bar   := b
+            last.price := price
+            if not na(last.leg)
+                line.set_xy2(last.leg, b, price)
+            ev := EV_REPLACE
+    ev
+
+// Index of the pivot at bar `b` with the given type, searching back from the end. -1 if absent.
+method indexOf(ZigZag this, int b, bool isHigh) =>
+    int idx = -1
+    int n   = this.pivots.size()
+    if n > 0
+        for i = n - 1 to 0
+            Pivot p = this.pivots.get(i)
+            if p.bar < b
+                break
+            if p.bar == b and p.isHigh == isHigh
+                idx := i
+                break
+    idx
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Matching (Rule A) and leg states
+// ─────────────────────────────────────────────────────────────────────────────
+f_restyle(line l, int state) =>
+    if not na(l)
+        bool sig = state != ST_NORMAL
+        line.set_color(l, sig ? sigColor : normColor)
+        line.set_width(l, sig ? sigWidth : normWidth)
+        line.set_style(l, state == ST_PENDING ? line.style_dashed : line.style_solid)
+
+// Re-evaluates the only fast legs whose state can still change. Runs after every
+// ZigZag event. Matching by bar and type is enough: both ZigZags read the price
+// from the same bar's high or low, so the prices are identical.
+method refresh(Matcher m, ZigZag fast, ZigZag slow, bool slowAppended) =>
+    // The slow ZigZag moved on: the previously latest slow leg can never change
+    // again, so its matched fast leg is Final and keeps its significant style.
+    if slowAppended and not na(m.confirmed)
+        m.finalCount += 1
+        m.confirmed := na
+    f_restyle(m.confirmed, ST_NORMAL)
+    f_restyle(m.pending, ST_NORMAL)
+    m.confirmed := na
+    m.pending   := na
+    int ns = slow.pivots.size()
+    if ns > 0
+        Pivot sEnd = slow.pivots.last()
+        int   iEnd = fast.indexOf(sEnd.bar, sEnd.isHigh)
+        if iEnd >= 0
+            // Confirmed: the fast leg ending at the latest slow pivot starts at the previous slow pivot.
+            if ns > 1 and iEnd > 0
+                Pivot sStart = slow.pivots.get(ns - 2)
+                Pivot fStart = fast.pivots.get(iEnd - 1)
+                if fStart.bar == sStart.bar and fStart.isHigh == sStart.isHigh
+                    m.confirmed := fast.pivots.get(iEnd).leg
+                    f_restyle(m.confirmed, ST_SIGNIFICANT)
+            // Pending: the fast leg starting at the latest slow pivot, whose slow end is not confirmed yet.
+            if showPending and iEnd < fast.pivots.size() - 1
+                m.pending := fast.pivots.get(iEnd + 1).leg
+                f_restyle(m.pending, ST_PENDING)
+
+// Feeds this bar's pivots into a ZigZag. When a pivot high and a pivot low land
+// on the same bar, the one opposite to the last pivot is processed first.
+// Returns the number of appended pivots.
+method feed(ZigZag this, bool ph, bool pl, int right, float hp, float lp, bool isSlow, ZigZag fast, ZigZag slow, Matcher m) =>
+    int  pb       = bar_index - right
+    bool lowFirst = ph and pl and this.pivots.size() > 0 and this.pivots.last().isHigh
+    int  appended = 0
+    for step = 0 to 1
+        bool doHigh = (step == 0) != lowFirst
+        if doHigh ? ph : pl
+            int ev = this.add(pb, doHigh ? hp : lp, doHigh)
+            if ev != EV_NONE
+                m.refresh(fast, slow, isSlow and ev == EV_APPEND)
+            if ev == EV_APPEND
+                appended += 1
+    appended
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Main
+// ─────────────────────────────────────────────────────────────────────────────
+// Pivot detection runs on every bar so the ta.* series stay consistent.
+bool fastPH = f_pivotHigh(fastLeft, fastRight)
+bool fastPL = f_pivotLow(fastLeft, fastRight)
+bool slowPH = f_pivotHigh(slowLeft, slowRight)
+bool slowPL = f_pivotLow(slowLeft, slowRight)
+
+var ZigZag  fastZZ = ZigZag.new(array.new<Pivot>(), FAST_MAX_PIVOTS, true, normColor, normWidth, line.style_solid)
+var ZigZag  slowZZ = ZigZag.new(array.new<Pivot>(), SLOW_MAX_PIVOTS, showSlow, slowColor, 1, line.style_dotted)
+var Matcher matcher = Matcher.new()
+
+var int fastAppends = 0
+var int slowAppends = 0
+
+// Only closed bars update the ZigZags, so nothing flickers inside a realtime bar.
+if barstate.isconfirmed
+    fastAppends += fastZZ.feed(fastPH, fastPL, fastRight, high[fastRight], low[fastRight], false, fastZZ, slowZZ, matcher)
+    slowAppends += slowZZ.feed(slowPH, slowPL, slowRight, high[slowRight], low[slowRight], true,  fastZZ, slowZZ, matcher)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stats
+// ─────────────────────────────────────────────────────────────────────────────
+var table stats = table.new(position.top_right, 2, 4, bgcolor = color.new(color.black, 80), border_width = 1)
+
+if showStats and barstate.islast
+    int fastLegs  = math.max(fastAppends - 1, 0)
+    int slowFinal = math.max(slowAppends - 2, 0)   // the latest slow leg is not final yet
+    string rate   = slowFinal > 0 ? str.tostring(100.0 * matcher.finalCount / slowFinal, "#.#") + "%" : "-"
+    table.cell(stats, 0, 0, "Fast legs",             text_color = color.silver, text_size = size.small, text_halign = text.align_left)
+    table.cell(stats, 1, 0, str.tostring(fastLegs),  text_color = color.white,  text_size = size.small)
+    table.cell(stats, 0, 1, "Slow legs (final)",     text_color = color.silver, text_size = size.small, text_halign = text.align_left)
+    table.cell(stats, 1, 1, str.tostring(slowFinal), text_color = color.white,  text_size = size.small)
+    table.cell(stats, 0, 2, "Significant (final)",   text_color = color.silver, text_size = size.small, text_halign = text.align_left)
+    table.cell(stats, 1, 2, str.tostring(matcher.finalCount), text_color = sigColor, text_size = size.small)
+    table.cell(stats, 0, 3, "Clean slow legs",       text_color = color.silver, text_size = size.small, text_halign = text.align_left)
+    table.cell(stats, 1, 3, rate,                    text_color = sigColor,     text_size = size.small)
