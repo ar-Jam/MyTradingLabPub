@@ -2,6 +2,9 @@
 //@version=6
 indicator("Significant Leg ZigZag", "SigLeg ZZ", overlay = true, max_lines_count = 500)
 
+// Pine requires at least one output call; all drawing is done with lines below.
+plot(na, "Dummy", editable = false)
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Inputs
 // ─────────────────────────────────────────────────────────────────────────────
@@ -225,6 +228,3 @@ if showStats and barstate.islast
     table.cell(stats, 1, 2, str.tostring(matcher.finalCount), text_color = sigColor, text_size = size.small)
     table.cell(stats, 0, 3, "Clean slow legs",       text_color = color.silver, text_size = size.small, text_halign = text.align_left)
     table.cell(stats, 1, 3, rate,                    text_color = sigColor,     text_size = size.small)
-
-// Pine requires at least one visible output call (a display.none plot does not count).
-plot(na, "Dummy", editable = false)
