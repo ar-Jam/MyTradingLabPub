@@ -226,5 +226,5 @@ if showStats and barstate.islast
     table.cell(stats, 0, 3, "Clean slow legs",       text_color = color.silver, text_size = size.small, text_halign = text.align_left)
     table.cell(stats, 1, 3, rate,                    text_color = sigColor,     text_size = size.small)
 
-// Pine requires at least one output call; the drawing is done with lines above.
-plot(na, "Dummy", display = display.none)
+// Pine requires at least one visible output call (a display.none plot does not count).
+plot(na, "Dummy", editable = false)
